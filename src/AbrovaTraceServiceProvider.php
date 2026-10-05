@@ -74,14 +74,15 @@ class AbrovaTraceServiceProvider extends ServiceProvider
                     return;
                 }
 
-                $handler->reportable(function (\Throwable $e) {
+                // Returns nothing on purpose: returning false would stop
+                // Laravel from writing the exception to the application's log.
+                $handler->reportable(function (\Throwable $e): void {
                     try {
                         if ($this->app->resolved(AbrovaTrace::class)) {
                             $this->app->make(AbrovaTrace::class)->captureException($e);
                         }
                     } catch (\Throwable) {
                     }
-                    return false;
                 });
             }
         );

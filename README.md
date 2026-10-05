@@ -128,7 +128,6 @@ Keys of `config/abrovatrace.php`:
 | `sample_rate` | `ABROVATRACE_SAMPLE_RATE` | `1.0` | Share of errors and messages to send, from 0.0 to 1.0 |
 | `timeout` | `ABROVATRACE_TIMEOUT` | `5` | Request timeout in seconds (1 to 30) |
 | `debug` | `ABROVATRACE_DEBUG` | `false` | Write SDK debug lines to the PHP error log |
-| `logging.enabled` | `ABROVATRACE_LOGGING_ENABLED` | `true` | Send logs |
 | `logging.source_id` | `ABROVATRACE_LOG_SOURCE_ID` | `null` | Id of this log source, for example `my-laravel-api` |
 | `performance.enabled` | `ABROVATRACE_PERFORMANCE_ENABLED` | `true` | Send performance data |
 | `performance.slow_query_threshold_ms` | | `500` | Queries at or above this duration are reported |

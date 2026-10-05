@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.4 - 2026-10-06
+
+- A report that is sent again is counted once: every error carries an `event_id` that stays the same on each attempt.
+
+## 0.2.3 - 2026-10-05
+
+- Exceptions are written to your application's own log again; the SDK used to stop Laravel's default logging.
+- An exception captured more than once is sent as one error.
+
 ## 0.2.2 - 2026-10-05
 
 First public release.

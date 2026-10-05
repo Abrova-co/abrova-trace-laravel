@@ -6,7 +6,7 @@ use InvalidArgumentException;
 
 class AbrovaTraceConfig
 {
-    const SDK_VERSION = '0.2.2';
+    const SDK_VERSION = '0.2.4';
     const PLATFORM = 'laravel';
 
     public readonly string $apiKey;

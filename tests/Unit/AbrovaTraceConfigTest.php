@@ -156,7 +156,7 @@ class AbrovaTraceConfigTest extends TestCase
 
     public function test_sdk_version_and_platform_constants(): void
     {
-        $this->assertEquals('0.2.2', AbrovaTraceConfig::SDK_VERSION);
+        $this->assertEquals('0.2.4', AbrovaTraceConfig::SDK_VERSION);
         $this->assertEquals('laravel', AbrovaTraceConfig::PLATFORM);
     }
 }
