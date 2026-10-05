@@ -1,0 +1,420 @@
+<?php
+
+namespace AbrovaTrace\Laravel;
+
+use AbrovaTrace\Laravel\Config\AbrovaTraceConfig;
+use AbrovaTrace\Laravel\Http\HttpClient;
+use AbrovaTrace\Laravel\Logging\LogLevel;
+use AbrovaTrace\Laravel\Logging\LogService;
+use AbrovaTrace\Laravel\Models\Breadcrumb;
+use AbrovaTrace\Laravel\Models\BreadcrumbManager;
+use AbrovaTrace\Laravel\Models\AbrovaTraceError;
+use AbrovaTrace\Laravel\Models\AbrovaTraceMessage;
+use AbrovaTrace\Laravel\Performance\PerformanceClient;
+use AbrovaTrace\Laravel\Performance\PerformanceSpan;
+use AbrovaTrace\Laravel\Utils\RateLimiter;
+use Symfony\Component\HttpKernel\Exception\HttpException;
+use Symfony\Component\HttpKernel\Exception\HttpExceptionInterface;
+
+class AbrovaTrace
+{
+    private AbrovaTraceConfig $config;
+    private ?HttpClient $http = null;
+    private ?BreadcrumbManager $breadcrumbs = null;
+    private ?RateLimiter $limiter = null;
+    private ?LogService $logger = null;
+    private ?PerformanceClient $apm = null;
+    private ?array $reqCtx = null;
+    private ?array $usrCtx = null;
+    private bool $ready = false;
+
+    public function __construct(AbrovaTraceConfig $config)
+    {
+        $this->config = $config;
+
+        if ($config->isEnabled()) {
+            $this->boot();
+        }
+    }
+
+    public function captureException(\Throwable $exception, array $options = []): void
+    {
+        if (! $this->canCapture() || $this->shouldIgnore($exception)) {
+            return;
+        }
+
+        try {
+            $err = AbrovaTraceError::fromThrowable($exception, [
+                'environment' => $this->config->environment,
+                'release' => $this->config->release,
+                'extra' => array_merge($options['extra'] ?? [], [
+                    'breadcrumbs' => $this->breadcrumbs?->getRecent(10),
+                    'request_context' => $this->requestContextFor($exception),
+                    'user_context' => $this->usrCtx,
+                ]),
+            ]);
+            $err->addLaravelContext();
+
+            $err = $this->applyBeforeSend($err);
+            if ($err === null) {
+                return;
+            }
+
+            $this->dispatch($err);
+        } catch (\Throwable $e) {
+            $this->debugLog('Error capturing exception: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Sends a message to Abrova Trace's Messages list (POST /api/messages).
+     *
+     * Options: `level` ('debug', 'info', 'warning' or 'error'; 'warn' becomes
+     * 'warning', 'fatal' and 'critical' become 'error', anything else 'info'),
+     * `extra` (array) and `tags` (string map). A message is never an issue.
+     */
+    public function captureMessage(string $message, array $options = []): void
+    {
+        if (! $this->canCapture()) {
+            return;
+        }
+
+        try {
+            $msg = AbrovaTraceMessage::create($message, [
+                'level' => $options['level'] ?? null,
+                'environment' => $this->config->environment,
+                'release' => $this->config->release,
+                'user_id' => $this->usrCtx['id'] ?? null,
+                'tags' => $options['tags'] ?? [],
+                'breadcrumbs' => $this->breadcrumbs?->getRecent(10) ?? [],
+                'extra' => array_merge($options['extra'] ?? [], array_filter([
+                    'request_context' => $this->reqCtx,
+                    'user_context' => $this->usrCtx,
+                ], fn ($val) => $val !== null)),
+            ]);
+            $msg->addLaravelContext();
+
+            $msg = $this->applyBeforeSend($msg);
+            if ($msg === null) {
+                return;
+            }
+
+            $this->dispatchMessage($msg);
+        } catch (\Throwable $e) {
+            $this->debugLog('Error capturing message: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Runs the configured before_send hook, if any.
+     *
+     * It sees errors (AbrovaTraceError) and messages (AbrovaTraceMessage).
+     * Returns the event to send, or null to drop it. A hook that throws must
+     * not lose the event or take the app down with it, so the original is sent
+     * and the failure is logged in debug mode. A replacement of a different
+     * type than the event is ignored and the original is sent.
+     *
+     * @template T of AbrovaTraceError|AbrovaTraceMessage
+     * @param T $event
+     * @return T|null
+     */
+    private function applyBeforeSend(AbrovaTraceError|AbrovaTraceMessage $event): AbrovaTraceError|AbrovaTraceMessage|null
+    {
+        $hook = $this->config->beforeSend;
+        if (! is_callable($hook)) {
+            return $event;
+        }
+
+        try {
+            $result = $hook($event);
+        } catch (\Throwable $e) {
+            $this->debugLog('before_send threw, sending the event unchanged: ' . $e->getMessage());
+            return $event;
+        }
+
+        if ($result === null || $result === false) {
+            return null;
+        }
+
+        return $result instanceof $event ? $result : $event;
+    }
+
+    public function addBreadcrumb(array|Breadcrumb $breadcrumb): void
+    {
+        if ($this->ready) {
+            $this->breadcrumbs?->add($breadcrumb);
+        }
+    }
+
+    public function setUser(array $user): void
+    {
+        $this->usrCtx = $user;
+    }
+
+    public function setRequestContext(array $context): void
+    {
+        $this->reqCtx = $context;
+    }
+
+    public function withScope(callable $callback): mixed
+    {
+        $prevReq = $this->reqCtx;
+        $prevUsr = $this->usrCtx;
+
+        try {
+            return $callback($this);
+        } finally {
+            $this->reqCtx = $prevReq;
+            $this->usrCtx = $prevUsr;
+        }
+    }
+
+    public function log(string $message, string $level = LogLevel::INFO, ?array $metadata = null): void
+    {
+        if (! $this->ready) {
+            return;
+        }
+        $this->initLogService();
+        $this->logger?->log($message, $level, $metadata, $this->usrCtx['id'] ?? null);
+    }
+
+    public function trace(string $msg, ?array $meta = null): void
+    {
+        $this->log($msg, LogLevel::TRACE, $meta);
+    }
+
+    public function logDebug(string $msg, ?array $meta = null): void
+    {
+        $this->log($msg, LogLevel::DEBUG, $meta);
+    }
+
+    public function info(string $msg, ?array $meta = null): void
+    {
+        $this->log($msg, LogLevel::INFO, $meta);
+    }
+
+    public function warn(string $msg, ?array $meta = null): void
+    {
+        $this->log($msg, LogLevel::WARN, $meta);
+    }
+
+    public function logError(string $msg, ?array $meta = null): void
+    {
+        $this->log($msg, LogLevel::ERROR, $meta);
+    }
+
+    public function fatal(string $msg, ?array $meta = null): void
+    {
+        $this->log($msg, LogLevel::FATAL, $meta);
+    }
+
+    public function pendingLogCount(): int
+    {
+        return $this->logger?->bufferSize() ?? 0;
+    }
+
+    public function reportPerformanceSpan(PerformanceSpan $span): void
+    {
+        if ($this->ready) {
+            $this->apm?->reportSpan($span);
+        }
+    }
+
+    public function reportPerformanceSpanBatch(array $spans): void
+    {
+        if (! $this->ready) {
+            return;
+        }
+        foreach ($spans as $s) {
+            $this->apm?->reportSpan($s);
+        }
+    }
+
+    public function trackOperation(string $operation, callable $fn, array $options = []): mixed
+    {
+        if (! $this->ready || ! $this->apm) {
+            return $fn();
+        }
+        return $this->apm->trackOperation($operation, $fn, $options);
+    }
+
+    public function flush(): void
+    {
+        try {
+            $this->logger?->flush();
+        } catch (\Throwable $e) {
+            $this->debugLog('Error flushing logs: ' . $e->getMessage());
+        }
+
+        try {
+            $this->apm?->flush();
+        } catch (\Throwable $e) {
+            $this->debugLog('Error flushing performance spans: ' . $e->getMessage());
+        }
+    }
+
+    public function isEnabled(): bool
+    {
+        return $this->config->isEnabled();
+    }
+
+    public function getConfig(): AbrovaTraceConfig
+    {
+        return $this->config;
+    }
+
+    public function getStats(): ?array
+    {
+        if (! $this->ready) {
+            return null;
+        }
+
+        return [
+            'isEnabled' => $this->config->isEnabled(),
+            'breadcrumbCount' => $this->breadcrumbs?->count() ?? 0,
+            'pendingLogs' => $this->logger?->bufferSize() ?? 0,
+            'pendingSpans' => $this->apm?->bufferSize() ?? 0,
+            'rateLimiter' => $this->limiter?->getStats(),
+            'config' => [
+                'environment' => $this->config->environment,
+                'release' => $this->config->release,
+                'apiKey' => mb_substr($this->config->apiKey, 0, 10) . '***',
+            ],
+        ];
+    }
+
+    private function boot(): void
+    {
+        $this->http = new HttpClient($this->config);
+        $this->breadcrumbs = new BreadcrumbManager($this->config->maxBreadcrumbs);
+
+        $rlConfig = $this->config->rateLimiting;
+        $this->limiter = new RateLimiter(
+            windowSeconds: $rlConfig['window_seconds'] ?? 60,
+            maxErrorsPerKey: $rlConfig['max_errors_per_key'] ?? 10,
+            maxTotal: $rlConfig['max_total'] ?? 100,
+        );
+
+        if ($this->config->logging['enabled'] ?? false) {
+            $this->logger = new LogService($this->config, $this->http);
+        }
+
+        if ($this->config->performance['enabled'] ?? false) {
+            $this->apm = new PerformanceClient($this->config, $this->http);
+        }
+
+        $this->ready = true;
+
+        $this->debugLog(sprintf(
+            'Initialized for Laravel %s (PHP %s)',
+            app()->version(),
+            PHP_VERSION
+        ));
+    }
+
+    private function canCapture(): bool
+    {
+        if (! $this->ready) {
+            return false;
+        }
+
+        $rate = $this->config->sampleRate;
+        if ($rate < 1.0 && (mt_rand() / mt_getrandmax()) > $rate) {
+            $this->debugLog('Event dropped due to sample rate');
+            return false;
+        }
+
+        return true;
+    }
+
+    private function dispatch(AbrovaTraceError $error): void
+    {
+        if (! $this->config->isEnabled()) {
+            return;
+        }
+
+        $check = $this->limiter->shouldSendError($error);
+        if (! $check['allowed']) {
+            $this->debugLog("Rate limited: {$check['reason']}");
+            return;
+        }
+
+        $resp = $this->http->sendError($error->toArray());
+
+        if (! $resp['success']) {
+            $this->debugLog('Failed to send error: ' . ($resp['error'] ?? 'unknown'));
+        }
+    }
+
+    /** Same path as dispatch(): rate limit, then a synchronous HTTP send. */
+    private function dispatchMessage(AbrovaTraceMessage $message): void
+    {
+        if (! $this->config->isEnabled()) {
+            return;
+        }
+
+        $check = $this->limiter->shouldSendMessage($message);
+        if (! $check['allowed']) {
+            $this->debugLog("Rate limited: {$check['reason']}");
+            return;
+        }
+
+        $resp = $this->http->sendMessage($message->toArray());
+
+        if (! $resp['success']) {
+            $this->debugLog('Failed to send message: ' . ($resp['error'] ?? 'unknown'));
+        }
+    }
+
+    /**
+     * The request context for an exception: what the middleware recorded, plus
+     * the HTTP status the exception maps to (`status_code`) when it carries one.
+     */
+    private function requestContextFor(\Throwable $e): ?array
+    {
+        $ctx = $this->reqCtx;
+        if ($ctx === null) {
+            return null;
+        }
+
+        if ($e instanceof HttpExceptionInterface && ! isset($ctx['status_code'])) {
+            $ctx['status_code'] = $e->getStatusCode();
+        }
+
+        return $ctx;
+    }
+
+    private function shouldIgnore(\Throwable $e): bool
+    {
+        $ignoredClasses = $this->config->exceptionHandler['ignored_exceptions'] ?? [];
+        foreach ($ignoredClasses as $cls) {
+            if ($e instanceof $cls) {
+                return true;
+            }
+        }
+
+        $report4xx = $this->config->exceptionHandler['report_4xx'] ?? false;
+        if (! $report4xx && $e instanceof HttpException) {
+            $code = $e->getStatusCode();
+            if ($code >= 400 && $code < 500) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function initLogService(): void
+    {
+        if ($this->logger === null && $this->http !== null) {
+            $this->logger = new LogService($this->config, $this->http);
+        }
+    }
+
+    private function debugLog(string $msg): void
+    {
+        if ($this->config->debug) {
+            error_log('[AbrovaTrace] ' . $msg);
+        }
+    }
+}
